@@ -1,0 +1,66 @@
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# ===================== LOAD DATA =====================
+FILE = r"E:\Vineetha\Vineetha_PHD_ONLY\Forth_Objective\SARS-CoV-2\Human_Serum_Plasma\Plasma\GO_Anti_Infla\Anti_Inflamatory_Molecules_GO_SARS-CoV-2_Plasma_Diff.xlsx"
+SHEET = "Sheet3"
+
+df = pd.read_excel(FILE, sheet_name=SHEET)
+df.columns = df.columns.str.strip()
+
+# ===================== CHECK REQUIRED COLUMNS =====================
+required = ["mapped genesymbol", "Differential_regulation", "Author_Condition"]
+missing = [c for c in required if c not in df.columns]
+if missing:
+    raise KeyError(f"Missing columns: {missing}")
+
+# ===================== CONVERT LABELS TO NUMBERS =====================
+map_values = {"Up": 1, "Down": -1, "nonDEG": 0}
+df["Value"] = df["Differential_regulation"].map(map_values)
+df = df.dropna(subset=["Value"])
+
+# ===================== PIVOT TABLE =====================
+pivot = df.pivot_table(
+    index="mapped genesymbol",
+    columns="Author_Condition",
+    values="Value",
+    aggfunc="mean"
+).fillna(0)
+
+# ===================== PLOT HEATMAP (YlGnBu) =====================
+plt.figure(figsize=(12, 10))
+
+sns.heatmap(
+    pivot,
+    cmap="YlGnBu",              # ⭐ NEW COLOR
+    linewidths=0.4,
+    linecolor="black",
+    cbar_kws={'label': 'Differential Status (-1 Down, 0 nonDEG, 1 Up)'}
+)
+
+# ===================== ADD SPACING BETWEEN GENE SYMBOLS =====================
+plt.yticks(rotation=0, fontsize=9)     # remove rotation, readable
+plt.xticks(rotation=90, fontsize=9)
+
+# ===================== LABELS =====================
+plt.xlabel("Study / Condition", fontsize=11, labelpad=10)
+plt.ylabel("Protein (Gene Symbol)", fontsize=11, labelpad=8)
+
+# Extra margin to avoid overlap
+plt.subplots_adjust(left=0.22, bottom=0.18)
+
+plt.tight_layout()
+
+# ===================== SAVE OUTPUT =====================
+out_png = r"E:\Vineetha\Heatmap_YlGnBu.png"
+out_pdf = r"E:\Vineetha\Heatmap_YlGnBu.pdf"
+
+plt.savefig(out_png, dpi=600, bbox_inches="tight")
+plt.savefig(out_pdf, dpi=600, bbox_inches="tight")
+
+print("\nSaved:")
+print(out_png)
+print(out_pdf)
+
+plt.show()
