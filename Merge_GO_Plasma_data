@@ -1,0 +1,99 @@
+import pandas as pd
+import os
+
+# ================== PATHS & SETTINGS ==================
+BASE_DIR = r"E:\Vineetha\Vineetha_PHD_ONLY\Forth_Objective\SARS-CoV-2\Human_Serum_Plasma\Plasma\GO_Anti_Infla"
+
+FILE1 = os.path.join(BASE_DIR, "Anti_Inflamatory_Molecules_GO.xlsx")    # Anti-inflammatory GO molecules
+SHEET1 = "Total"
+
+FILE2 = os.path.join(BASE_DIR, "SARS-CoV-2_Plasma_08122025.xlsx")       # Plasma data
+SHEET2 = "HeatMap"                                                      # Main data with No_of_patients_in_discovery_cohort
+
+OUTPUT_FILE = os.path.join(BASE_DIR, "Merged_Exploded_Only_08122025.xlsx")
+
+KEY_COL = "mapped genesymbol"
+PATIENTS_COL = "No_of_patients_in_discovery_cohort"
+
+
+# ================== FUNCTIONS ==================
+def auto_explode(df, separators=None, exclude_cols=None):
+    """
+    Explodes all columns containing multi-values separated by ; , | or /,
+    EXCEPT columns listed in exclude_cols.
+    """
+    if separators is None:
+        separators = [';', ',', '|', '/']
+    if exclude_cols is None:
+        exclude_cols = []
+
+    for col in df.columns:
+        if col in exclude_cols:
+            continue  # do NOT touch this column
+        if df[col].dtype == object:
+            s = df[col].astype(str)
+            for sep in separators:
+                if s.str.contains(sep).any():
+                    df[col] = s.apply(lambda x: [i.strip() for i in x.split(sep)])
+                    df = df.explode(col)
+                    break
+    return df
+
+
+# ================== LOAD DATA ==================
+print("Reading input files...")
+df1 = pd.read_excel(FILE1, sheet_name=SHEET1)
+df2 = pd.read_excel(FILE2, sheet_name=SHEET2)
+
+# Strip whitespace from column names
+df1.columns = df1.columns.str.strip()
+df2.columns = df2.columns.str.strip()
+
+print("\nColumns in FILE1 (GO list):")
+print(df1.columns.tolist())
+print("\nColumns in FILE2 (HeatMap main data):")
+print(df2.columns.tolist())
+
+# ================== CHECK MERGE COLUMN ==================
+if KEY_COL not in df1.columns:
+    raise KeyError(f"'{KEY_COL}' not found in FILE1 (sheet {SHEET1}). "
+                   f"Available columns: {df1.columns.tolist()}")
+
+if KEY_COL not in df2.columns:
+    raise KeyError(f"'{KEY_COL}' not found in FILE2 (sheet {SHEET2}). "
+                   f"Available columns: {df2.columns.tolist()}")
+
+# ================== ENSURE PATIENTS COLUMN COMES ONLY FROM FILE2 ==================
+if PATIENTS_COL in df1.columns and PATIENTS_COL in df2.columns:
+    print(f"\n'{PATIENTS_COL}' is present in both files. Dropping it from FILE1 to keep FILE2 version unchanged.")
+    df1 = df1.drop(columns=[PATIENTS_COL])
+
+# ================== AUTO-EXPLODE ==================
+print("\nAuto-exploding multi-valued columns...")
+# df1: can explode all columns
+df1_exp = auto_explode(df1.copy())
+
+# df2: DO NOT explode No_of_patients_in_discovery_cohort
+df2_exp = auto_explode(df2.copy(), exclude_cols=[PATIENTS_COL])
+
+print(f"FILE1 rows before explode: {len(df1)}, after explode: {len(df1_exp)}")
+print(f"FILE2 rows before explode: {len(df2)}, after explode: {len(df2_exp)}")
+
+# ================== MERGE ==================
+print(f"\nMerging on '{KEY_COL}' (inner join)...")
+merged = pd.merge(df1_exp, df2_exp, on=KEY_COL, how='inner')
+
+print(f"Merged total rows: {len(merged)}")
+print(f"Unique {KEY_COL} in merged: {merged[KEY_COL].nunique()}")
+
+# Check that patients column is there with correct name
+if PATIENTS_COL in merged.columns:
+    print(f"\n✅ '{PATIENTS_COL}' is present in merged file as a single column (no _x/_y).")
+else:
+    print(f"\n⚠️ Warning: '{PATIENTS_COL}' not found in merged columns!")
+
+# ================== SAVE OUTPUT ==================
+merged.to_excel(OUTPUT_FILE, sheet_name="Merged_Exploded", index=False)
+
+print("\nExplode + Merge Complete!")
+print(f"Output saved to: {OUTPUT_FILE}")
