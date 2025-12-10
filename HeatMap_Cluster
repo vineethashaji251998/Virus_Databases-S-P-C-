@@ -1,0 +1,351 @@
+import os
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from matplotlib.colors import Normalize
+import matplotlib as mpl  # for new colormap API
+
+# ================== USER SETTINGS ==================
+
+EXCEL_FILE = r"E:\Vineetha\Vineetha_PHD_ONLY\Forth_Objective\Heatmaps\Viruses_Heatmaps_Anti_Pro_Diff_Plasma.xlsx"
+BASE_SAVE_DIR = r"E:\Vineetha\Vineetha_PHD_ONLY\Forth_Objective\Heatmaps"
+
+# Only these 4 sheets (as you requested)
+SHEETS_TO_PROCESS = [
+    "SARS-CoV-2_Serum_Proinfla",
+    "SARS-CoV-2_Serum_Antiinfla",
+    "HBV_Serum_Pro_Infla",
+    "HBV_Serum_Anti_Infla"
+]
+
+COL_GENE = "mapped genesymbol"
+COL_COND = "Author_Condition"
+COL_REG = "Differential_regulation"
+
+
+def generate_gene_condition_heatmap(
+    excel_file,
+    sheet_name,
+    png_file,
+    pdf_file,
+    svg_file,
+    ai_file,
+    xlsx_file,
+    title
+):
+    """
+    For a given sheet:
+    - Try to generate a clustered heatmap (clustermap).
+    - If clustering fails, fall back to a normal heatmap.
+    - Save clustered/ordered matrix to Excel.
+    """
+
+    try:
+        print("\n" + "=" * 60)
+        print(f"Processing: {sheet_name}")
+        print("=" * 60)
+
+        # -------- 1. LOAD EXCEL SHEET --------
+        df = pd.read_excel(excel_file, sheet_name=sheet_name, dtype=str)
+        df.columns = df.columns.str.strip()
+
+        print(f"Columns in '{sheet_name}': {list(df.columns)}")
+
+        # -------- 2. VERIFY / DETECT REQUIRED COLUMNS --------
+        # Check gene + condition columns strictly
+        base_required = [COL_GENE, COL_COND]
+        missing_base = [c for c in base_required if c not in df.columns]
+        if missing_base:
+            raise ValueError(
+                f"Missing required columns in '{sheet_name}': {missing_base}"
+            )
+
+        # Detect regulation column
+        reg_col = None
+        if COL_REG in df.columns:
+            reg_col = COL_REG
+        else:
+            # Try to find any column containing "regulation"
+            possible_reg_cols = [
+                c for c in df.columns if "regulation" in c.lower()
+            ]
+            if possible_reg_cols:
+                reg_col = possible_reg_cols[0]
+                print(f"⚠ '{COL_REG}' not found, using '{reg_col}' instead in '{sheet_name}'.")
+                df = df.rename(columns={reg_col: COL_REG})
+                reg_col = COL_REG
+            else:
+                raise ValueError(
+                    f"Missing required column '{COL_REG}' "
+                    f"or any column containing 'regulation' in '{sheet_name}'."
+                )
+
+        required_cols = [COL_GENE, COL_COND, COL_REG]
+        df = df[required_cols].copy()
+        print(f"✓ Loaded {len(df)} rows from sheet '{sheet_name}'")
+
+        # -------- 3. CLEAN VALUES --------
+        df[COL_GENE] = df[COL_GENE].astype(str).str.strip().str.upper()
+        df[COL_COND] = df[COL_COND].astype(str).str.strip()
+        df[COL_REG] = df[COL_REG].astype(str).str.strip().str.capitalize()
+
+        # Map regulation values
+        regulation_map = {"Up": 1, "Down": -1}
+        df["numeric_regulation"] = df[COL_REG].map(regulation_map).fillna(0)
+
+        # Remove empty gene names
+        df = df[df[COL_GENE] != ""].copy()
+        print(f"✓ After cleaning: {len(df)} rows with valid gene names")
+
+        # -------- 4. GROUP DUPLICATES --------
+        df_grouped = (
+            df.groupby([COL_GENE, COL_COND])["numeric_regulation"]
+              .mean()
+              .reset_index()
+        )
+        print(f"✓ After grouping: {len(df_grouped)} unique gene-condition pairs")
+
+        # -------- 5. PIVOT --------
+        heatmap_data = df_grouped.pivot(
+            index=COL_GENE,
+            columns=COL_COND,
+            values="numeric_regulation"
+        ).fillna(0)
+
+        n_rows, n_cols = heatmap_data.shape
+        print(f"✓ Heatmap dimensions: {n_rows} genes × {n_cols} conditions")
+
+        if n_rows == 0 or n_cols == 0:
+            raise ValueError("Heatmap has zero rows or columns after processing.")
+
+        # -------- 6. GLOBAL STYLE --------
+        plt.rcParams["font.family"] = "Times New Roman"
+        plt.rcParams["font.size"] = 12
+        sns.set(font_scale=1.0)
+
+        fig_width = max(15, n_cols * 0.55)
+        fig_height = max(11, n_rows * 0.45)
+
+        # -------- 7. TRY CLUSTERMAP FIRST --------
+        clustered = True
+        try:
+            print("✓ Generating CLUSTERED heatmap (clustermap)...")
+            g = sns.clustermap(
+                heatmap_data,
+                figsize=(fig_width, fig_height),
+                cmap="YlGnBu",
+                center=0,
+                vmin=-1,
+                vmax=1,
+                linewidths=0.4,
+                linecolor="gray",
+                row_cluster=True,
+                col_cluster=True,
+                metric="euclidean",
+                method="average",
+                cbar_pos=None  # We'll add custom colorbar
+            )
+            fig = g.fig
+            ax_heatmap = g.ax_heatmap
+
+            # Reordering info for saving clustered matrix
+            ordered_rows = heatmap_data.index[g.dendrogram_row.reordered_ind]
+            ordered_cols = heatmap_data.columns[g.dendrogram_col.reordered_ind]
+
+        except Exception as e:
+            print(f"⚠ Clustering failed for '{sheet_name}', falling back to NORMAL heatmap.")
+            print(f"  Reason: {e}")
+            clustered = False
+            g = None
+
+            fig, ax_heatmap = plt.subplots(figsize=(fig_width, fig_height))
+            sns.heatmap(
+                heatmap_data,
+                ax=ax_heatmap,
+                cmap="YlGnBu",
+                center=0,
+                vmin=-1,
+                vmax=1,
+                linewidths=0.4,
+                linecolor="gray",
+                cbar=False  # We'll add our own colorbar
+            )
+
+            # No reordering; use original order
+            ordered_rows = heatmap_data.index
+            ordered_cols = heatmap_data.columns
+
+        # -------- 8. FORMAT AXIS LABELS --------
+        plt.setp(
+            ax_heatmap.get_xticklabels(),
+            rotation=60,
+            ha="right",
+            fontsize=11,
+            fontname="Times New Roman"
+        )
+        plt.setp(
+            ax_heatmap.get_yticklabels(),
+            fontsize=11,
+            fontname="Times New Roman"
+        )
+
+        # -------- 9. LAYOUT & TITLE --------
+        fig.subplots_adjust(left=0.10, bottom=0.15, top=0.95, right=0.78)
+
+        if title:
+            fig.suptitle(
+                title,
+                fontsize=16,
+                y=0.98,
+                fontname="Times New Roman",
+                weight="bold"
+            )
+
+        # -------- 10. COLORBAR --------
+        cax = fig.add_axes([0.88, 0.45, 0.02, 0.35])
+        norm = Normalize(vmin=-1, vmax=1)
+        cmap_obj = mpl.colormaps.get_cmap("YlGnBu")
+
+        cb = plt.colorbar(
+            mpl.cm.ScalarMappable(norm=norm, cmap=cmap_obj),
+            cax=cax
+        )
+        cb.set_label("Regulation Value", fontsize=12, labelpad=10, fontname="Times New Roman")
+        cb.ax.tick_params(labelsize=11)
+        cb.set_ticks([-1, -0.5, 0, 0.5, 1])
+        cb.set_ticklabels(["-1.0", "-0.5", "0.0", "0.5", "1.0"])
+        for label in cb.ax.get_yticklabels():
+            label.set_fontname("Times New Roman")
+
+        # -------- 11. LEGEND --------
+        legend_handles = [
+            Patch(facecolor=cmap_obj(norm(-1)), edgecolor="black", linewidth=1.5, label="Down-regulated"),
+            Patch(facecolor=cmap_obj(norm(0)), edgecolor="black", linewidth=1.5, label="No change"),
+            Patch(facecolor=cmap_obj(norm(1)), edgecolor="black", linewidth=1.5, label="Up-regulated"),
+        ]
+
+        legend = fig.legend(
+            handles=legend_handles,
+            title="Regulation Scale",
+            loc="center",
+            bbox_to_anchor=(0.94, 0.20),
+            frameon=True,
+            fontsize=11,
+            title_fontsize=12,
+            edgecolor="black",
+            fancybox=False,
+            shadow=False,
+            prop={"family": "Arial", "weight": "bold"}
+        )
+        legend.get_frame().set_linewidth(1.5)
+        legend.get_title().set_fontname("Arial")
+        legend.get_title().set_fontweight("bold")
+
+        # Extra text (scale explanation)
+        fig.text(0.94, 0.12, "Values:", ha="center", fontsize=11, weight="bold", fontname="Arial")
+        fig.text(0.94, 0.09, "-1 = Down", ha="center", fontsize=10, fontname="Arial", weight="bold")
+        fig.text(0.94, 0.06, " 0 = No change", ha="center", fontsize=10, fontname="Arial", weight="bold")
+        fig.text(0.94, 0.03, "+1 = Up", ha="center", fontsize=10, fontname="Arial", weight="bold")
+
+        # -------- 12. SAVE FIGURES --------
+        print(f"✓ Saving PNG to: {png_file}")
+        fig.savefig(png_file, dpi=300, bbox_inches="tight")
+
+        print(f"✓ Saving PDF to: {pdf_file}")
+        fig.savefig(pdf_file, dpi=300, bbox_inches="tight", format="pdf")
+
+        print(f"✓ Saving SVG to: {svg_file}")
+        fig.savefig(svg_file, dpi=300, bbox_inches="tight", format="svg")
+
+        print(f"✓ Saving AI (PDF) to: {ai_file}")
+        fig.savefig(ai_file, dpi=300, bbox_inches="tight", format="pdf")
+        print("Note: .ai file is saved as PDF (Adobe Illustrator compatible)")
+
+        # -------- 13. SAVE ORDERED / UNORDERED MATRIX --------
+        clustered_data = heatmap_data.loc[ordered_rows, ordered_cols]
+
+        print(f"✓ Saving clustered matrix to: {xlsx_file}")
+        with pd.ExcelWriter(xlsx_file, engine="openpyxl") as writer:
+            clustered_data.to_excel(writer, sheet_name="Clustered_Matrix")
+
+            metadata = pd.DataFrame({
+                "Property": [
+                    "Sheet Name",
+                    "Number of Genes",
+                    "Number of Conditions",
+                    "Clustering Performed",
+                    "Clustering Method",
+                    "Distance Metric",
+                    "Scale",
+                    "Down Regulation",
+                    "No Change",
+                    "Up Regulation",
+                ],
+                "Value": [
+                    sheet_name,
+                    n_rows,
+                    n_cols,
+                    "Yes" if clustered else "No",
+                    "average" if clustered else "N/A",
+                    "euclidean" if clustered else "N/A",
+                    "-1 to +1",
+                    "-1",
+                    "0",
+                    "+1",
+                ],
+            })
+            metadata.to_excel(writer, sheet_name="Metadata", index=False)
+
+        print(f"✓ Sheet '{sheet_name}' completed successfully!\n")
+        plt.close(fig)
+        return True
+
+    except Exception as e:
+        print(f"✗ Error generating heatmap for sheet '{sheet_name}': {e}")
+        return False
+
+
+# ================== MAIN: PROCESS 4 SERUM SHEETS ==================
+if __name__ == "__main__":
+    print("\n" + "=" * 60)
+    print("STARTING BATCH PROCESSING OF SELECTED SERUM SHEETS")
+    print("=" * 60)
+
+    successful = 0
+    failed = 0
+
+    for sheet_name in SHEETS_TO_PROCESS:
+        save_dir = os.path.join(BASE_SAVE_DIR, sheet_name)
+        os.makedirs(save_dir, exist_ok=True)
+
+        png_file = os.path.join(save_dir, f"{sheet_name}.png")
+        pdf_file = os.path.join(save_dir, f"{sheet_name}.pdf")
+        svg_file = os.path.join(save_dir, f"{sheet_name}.svg")
+        ai_file = os.path.join(save_dir, f"{sheet_name}.ai")
+        xlsx_file = os.path.join(save_dir, f"{sheet_name}_clustered.xlsx")
+
+        ok = generate_gene_condition_heatmap(
+            excel_file=EXCEL_FILE,
+            sheet_name=sheet_name,
+            png_file=png_file,
+            pdf_file=pdf_file,
+            svg_file=svg_file,
+            ai_file=ai_file,
+            xlsx_file=xlsx_file,
+            title=f"{sheet_name} - Gene × Condition Heatmap"
+        )
+
+        if ok:
+            successful += 1
+        else:
+            failed += 1
+
+    print("\n" + "=" * 60)
+    print("BATCH PROCESSING COMPLETE")
+    print("=" * 60)
+    print(f"✓ Successfully processed: {successful} sheets")
+    if failed > 0:
+        print(f"✗ Failed: {failed} sheets")
+    print(f"📁 Output base directory: {BASE_SAVE_DIR}")
+    print("=" * 60 + "\n")
