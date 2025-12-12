@@ -1,0 +1,473 @@
+import pandas as pd
+import os
+from datetime import datetime
+import traceback
+
+# -------------------------
+# USER SETTINGS
+# -------------------------
+input_file = r"E:\Vineetha\Vineetha_PHD_ONLY\Forth_Objective\SARS-CoV-2\Human_Serum_Plasma\Plasma\SARS-CoV-2_Plasma_06122025.xlsx"
+target_sheet = "SARS-CoV-2-Total_Plasma_Diff"
+output_dir = os.path.dirname(input_file)
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+output_file = os.path.join(output_dir, f"Consistent_Regulation_Ranking_{timestamp}.xlsx")
+
+# -------------------------
+# Helper - print header
+# -------------------------
+print("="*80)
+print("CONSISTENT REGULATION RANKING ANALYSIS (UP & DOWN)")
+print("="*80)
+print(f"\nInput File: {os.path.basename(input_file)}")
+print(f"Target Sheet: {target_sheet}")
+print(f"Output Directory: {output_dir}")
+print("="*80)
+
+# -------------------------
+# Read sheet
+# -------------------------
+print(f"\n[1/6] Reading sheet '{target_sheet}'...")
+try:
+    df = pd.read_excel(input_file, sheet_name=target_sheet)
+    print("✓ Sheet loaded successfully")
+    print(f"  - Rows: {len(df)}")
+    print(f"  - Columns: {len(df.columns)}")
+except Exception as e:
+    print("✗ ERROR loading sheet:")
+    traceback.print_exc()
+    raise SystemExit(1)
+
+# -------------------------
+# Identify required columns
+# -------------------------
+print(f"\n[2/6] Identifying columns...")
+print("-"*80)
+
+gene_col = None
+condition_col = None
+virus_col = None
+regulation_col = None
+
+for col in df.columns:
+    col_lower = str(col).lower()
+    if 'mapped_genesymbol' in col_lower or 'mapped genesymbol' in col_lower or col_lower == 'gene' or 'gene' == col_lower:
+        gene_col = col
+    elif 'condition' in col_lower:
+        condition_col = col
+    elif 'disease' in col_lower and 'virus' in col_lower:
+        virus_col = col
+    elif virus_col is None and 'virus' in col_lower:
+        virus_col = col
+    elif 'regulation' in col_lower or 'differential' in col_lower or 'foldchange' in col_lower:
+        regulation_col = col
+
+print(f"  Gene Symbol: {gene_col if gene_col else '❌ NOT FOUND'}")
+print(f"  Condition: {condition_col if condition_col else '❌ NOT FOUND'}")
+print(f"  Virus/Disease: {virus_col if virus_col else '❌ NOT FOUND'}")
+print(f"  Regulation: {regulation_col if regulation_col else '❌ NOT FOUND'}")
+
+if not gene_col or not regulation_col:
+    print("\n✗ ERROR: Required columns not found!")
+    print("Available columns:")
+    for c in df.columns:
+        print(" -", c)
+    raise SystemExit(1)
+
+# -------------------------
+# Clean data
+# -------------------------
+print(f"\n[3/6] Cleaning and preparing data...")
+print("-"*80)
+
+df_clean = df.copy()
+
+# Ensure gene and regulation are strings
+df_clean[gene_col] = df_clean[gene_col].astype(str).str.strip()
+df_clean[regulation_col] = df_clean[regulation_col].astype(str).str.strip()
+
+# Trim condition/virus if they exist
+if condition_col:
+    df_clean[condition_col] = df_clean[condition_col].astype(str).str.strip()
+if virus_col:
+    df_clean[virus_col] = df_clean[virus_col].astype(str).str.strip()
+
+# Remove invalid gene rows
+df_clean = df_clean[
+    (df_clean[gene_col].notna()) &
+    (df_clean[gene_col].str.lower() != 'nan') &
+    (df_clean[gene_col].str.strip() != '')
+].copy()
+
+print(f"  Valid rows: {len(df_clean)}")
+print(f"  Unique genes: {df_clean[gene_col].nunique()}")
+
+# Show sample of unique regulation values to help debug classification
+unique_regs = pd.Series(df_clean[regulation_col].unique()).astype(str).head(100).tolist()
+print(f"  Sample unique regulation values (up to 100 shown): {unique_regs}")
+
+# -------------------------
+# Classify regulation
+# -------------------------
+# Expand keywords if your data uses other words/symbols (e.g. 'higher', 'lowered', '↑', '↓')
+up_keywords = ['UP', 'UPREGULATED', 'UP-REGULATED', 'UPREG', 'INCREASED', 'INCREASE', 'HIGHER', '↑']
+down_keywords = ['DOWN', 'DOWNREGULATED', 'DOWN-REGULATED', 'DOWNREG', 'DECREASED', 'DECREASE', 'LOWER', 'LOWERED', '↓']
+
+def classify_regulation(reg_value):
+    reg_str = str(reg_value).upper().strip()
+    # remove common punctuation
+    for ch in [',', ';', ':', '(', ')', '[', ']', '"', "'"]:
+        reg_str = reg_str.replace(ch, ' ')
+    # check for keywords
+    if any(keyword in reg_str for keyword in up_keywords):
+        return 'UP'
+    elif any(keyword in reg_str for keyword in down_keywords):
+        return 'DOWN'
+    else:
+        return 'OTHER'
+
+df_clean['Regulation_Type'] = df_clean[regulation_col].apply(classify_regulation)
+
+up_regulated = df_clean[df_clean['Regulation_Type'] == 'UP'].copy()
+down_regulated = df_clean[df_clean['Regulation_Type'] == 'DOWN'].copy()
+other_regulated = df_clean[df_clean['Regulation_Type'] == 'OTHER'].copy()
+
+print(f"  UP-regulated entries: {len(up_regulated)}")
+print(f"  DOWN-regulated entries: {len(down_regulated)}")
+print(f"  Other/Unknown entries: {len(other_regulated)}")
+
+# -------------------------
+# Analysis - UP ranking
+# -------------------------
+print(f"\n[4/6] Analyzing consistent regulation patterns...")
+print("="*80)
+
+print("\n[Analysis 1] UP-Regulated Genes Ranking")
+print("-"*80)
+
+up_ranking = []
+for gene in up_regulated[gene_col].unique():
+    gene_data = up_regulated[up_regulated[gene_col] == gene]
+    num_conditions = gene_data[condition_col].nunique() if condition_col else 0
+    num_viruses = gene_data[virus_col].nunique() if virus_col else 0
+    consistency_score = num_conditions * num_viruses
+    up_ranking.append({
+        'mapped_genesymbol': gene,
+        'Total_UP_Count': len(gene_data),
+        'Num_Conditions': num_conditions,
+        'Num_Viruses': num_viruses,
+        'Consistency_Score': consistency_score,
+        'Conditions': ', '.join(pd.Series(gene_data[condition_col].dropna().unique()[:5].astype(str))) if condition_col else 'N/A',
+        'Viruses': ', '.join(pd.Series(gene_data[virus_col].dropna().unique()[:5].astype(str))) if virus_col else 'N/A'
+    })
+
+df_up_ranking = pd.DataFrame(up_ranking)
+
+if not df_up_ranking.empty and 'Consistency_Score' in df_up_ranking.columns:
+    df_up_ranking = df_up_ranking.sort_values('Consistency_Score', ascending=False)
+    df_up_ranking['Rank'] = range(1, len(df_up_ranking) + 1)
+print(f"✓ {len(df_up_ranking)} genes with UP-regulation")
+if 'Consistency_Score' in df_up_ranking.columns and not df_up_ranking['Consistency_Score'].isna().all():
+    print(f"✓ Top UP consistency score: {df_up_ranking['Consistency_Score'].max()}")
+
+# -------------------------
+# Analysis - DOWN ranking (robust)
+# -------------------------
+print("\n[Analysis 2] DOWN-Regulated Genes Ranking")
+print("-"*80)
+
+down_ranking = []
+for gene in down_regulated[gene_col].unique():
+    gene_data = down_regulated[down_regulated[gene_col] == gene]
+    num_conditions = gene_data[condition_col].nunique() if condition_col else 0
+    num_viruses = gene_data[virus_col].nunique() if virus_col else 0
+    consistency_score = num_conditions * num_viruses
+    down_ranking.append({
+        'mapped_genesymbol': gene,
+        'Total_DOWN_Count': len(gene_data),
+        'Num_Conditions': num_conditions,
+        'Num_Viruses': num_viruses,
+        'Consistency_Score': consistency_score,
+        'Conditions': ', '.join(pd.Series(gene_data[condition_col].dropna().unique()[:5].astype(str))) if condition_col else 'N/A',
+        'Viruses': ', '.join(pd.Series(gene_data[virus_col].dropna().unique()[:5].astype(str))) if virus_col else 'N/A'
+    })
+
+# Create DataFrame with expected columns to avoid KeyError on empty lists
+expected_down_cols = ['mapped_genesymbol','Total_DOWN_Count','Num_Conditions','Num_Viruses','Consistency_Score','Conditions','Viruses']
+df_down_ranking = pd.DataFrame(down_ranking, columns=expected_down_cols)
+
+# Only sort if Consistency_Score exists and has non-null values
+if not df_down_ranking.empty and df_down_ranking['Consistency_Score'].notna().any():
+    df_down_ranking = df_down_ranking.sort_values('Consistency_Score', ascending=False)
+    df_down_ranking['Rank'] = range(1, len(df_down_ranking) + 1)
+else:
+    if df_down_ranking.empty:
+        print("⚠️ WARNING: No DOWN-regulated genes found (df_down_ranking is empty).")
+    else:
+        print("⚠️ WARNING: 'Consistency_Score' column missing or empty in df_down_ranking.")
+print(f"✓ {len(df_down_ranking)} genes with DOWN-regulation")
+if 'Consistency_Score' in df_down_ranking.columns and df_down_ranking['Consistency_Score'].notna().any():
+    print(f"✓ Top DOWN consistency score: {df_down_ranking['Consistency_Score'].max()}")
+
+# -------------------------
+# Analysis - BOTH up & down
+# -------------------------
+print("\n[Analysis 3] Genes with BOTH UP and DOWN Regulation")
+print("-"*80)
+
+up_genes = set(up_regulated[gene_col].unique())
+down_genes = set(down_regulated[gene_col].unique())
+both_genes = up_genes & down_genes
+
+print(f"✓ {len(both_genes)} genes show both UP and DOWN regulation")
+
+both_analysis = []
+for gene in both_genes:
+    up_data = up_regulated[up_regulated[gene_col] == gene]
+    down_data = down_regulated[down_regulated[gene_col] == gene]
+    up_conditions = up_data[condition_col].nunique() if condition_col else 0
+    down_conditions = down_data[condition_col].nunique() if condition_col else 0
+    up_viruses = up_data[virus_col].nunique() if virus_col else 0
+    down_viruses = down_data[virus_col].nunique() if virus_col else 0
+    both_analysis.append({
+        'mapped_genesymbol': gene,
+        'Total_UP': len(up_data),
+        'Total_DOWN': len(down_data),
+        'Total_Regulated': len(up_data) + len(down_data),
+        'UP_Conditions': up_conditions,
+        'DOWN_Conditions': down_conditions,
+        'UP_Viruses': up_viruses,
+        'DOWN_Viruses': down_viruses,
+        'UP_Consistency': up_conditions * up_viruses,
+        'DOWN_Consistency': down_conditions * down_viruses,
+        'Overall_Diversity': (up_conditions + down_conditions) * (up_viruses + down_viruses)
+    })
+
+df_both = pd.DataFrame(both_analysis)
+if not df_both.empty:
+    df_both = df_both.sort_values('Overall_Diversity', ascending=False)
+    df_both['Rank'] = range(1, len(df_both) + 1)
+
+# -------------------------
+# Analysis - Comprehensive
+# -------------------------
+print("\n[Analysis 4] Comprehensive Gene Statistics")
+print("-"*80)
+
+all_genes = set(df_clean[gene_col].unique())
+comprehensive_stats = []
+
+for gene in all_genes:
+    gene_data = df_clean[df_clean[gene_col] == gene]
+    up_data = gene_data[gene_data['Regulation_Type'] == 'UP']
+    down_data = gene_data[gene_data['Regulation_Type'] == 'DOWN']
+    total_count = len(gene_data)
+    up_count = len(up_data)
+    down_count = len(down_data)
+    num_conditions = gene_data[condition_col].nunique() if condition_col else 0
+    num_viruses = gene_data[virus_col].nunique() if virus_col else 0
+    up_conditions = up_data[condition_col].nunique() if condition_col and len(up_data) > 0 else 0
+    up_viruses = up_data[virus_col].nunique() if virus_col and len(up_data) > 0 else 0
+    down_conditions = down_data[condition_col].nunique() if condition_col and len(down_data) > 0 else 0
+    down_viruses = down_data[virus_col].nunique() if virus_col and len(down_data) > 0 else 0
+
+    if up_count > down_count:
+        predominant = 'UP'
+        consistency = up_conditions * up_viruses
+    elif down_count > up_count:
+        predominant = 'DOWN'
+        consistency = down_conditions * down_viruses
+    elif up_count == down_count and up_count > 0:
+        predominant = 'MIXED'
+        consistency = num_conditions * num_viruses
+    else:
+        predominant = 'NONE'
+        consistency = 0
+
+    comprehensive_stats.append({
+        'mapped_genesymbol': gene,
+        'Predominant_Regulation': predominant,
+        'Total_Occurrences': total_count,
+        'UP_Count': up_count,
+        'DOWN_Count': down_count,
+        'Total_Conditions': num_conditions,
+        'Total_Viruses': num_viruses,
+        'UP_Conditions': up_conditions,
+        'UP_Viruses': up_viruses,
+        'DOWN_Conditions': down_conditions,
+        'DOWN_Viruses': down_viruses,
+        'Consistency_Score': consistency,
+        'UP_Consistency': up_conditions * up_viruses,
+        'DOWN_Consistency': down_conditions * down_viruses
+    })
+
+df_comprehensive = pd.DataFrame(comprehensive_stats)
+if not df_comprehensive.empty:
+    df_comprehensive = df_comprehensive.sort_values('Consistency_Score', ascending=False)
+    df_comprehensive['Overall_Rank'] = range(1, len(df_comprehensive) + 1)
+
+print(f"✓ Analyzed {len(df_comprehensive)} total genes")
+
+# -------------------------
+# Analysis - Condition-Virus matrices
+# -------------------------
+print("\n[Analysis 5] Creating Condition-Virus Matrices")
+print("-"*80)
+
+# UP matrix for top genes
+top_up_genes = df_up_ranking.head(30)['mapped_genesymbol'].tolist() if not df_up_ranking.empty else []
+up_matrix = []
+for gene in top_up_genes:
+    gene_data = up_regulated[up_regulated[gene_col] == gene]
+    if condition_col and virus_col:
+        for condition in pd.Series(gene_data[condition_col].dropna().unique()):
+            for virus in pd.Series(gene_data[virus_col].dropna().unique()):
+                count = len(gene_data[(gene_data[condition_col] == condition) & (gene_data[virus_col] == virus)])
+                if count > 0:
+                    up_matrix.append({
+                        'mapped_genesymbol': gene,
+                        'Condition': condition,
+                        'Virus': virus,
+                        'UP_Count': count
+                    })
+
+df_up_matrix = pd.DataFrame(up_matrix)
+
+# DOWN matrix for top genes
+top_down_genes = df_down_ranking.head(30)['mapped_genesymbol'].tolist() if not df_down_ranking.empty else []
+down_matrix = []
+for gene in top_down_genes:
+    gene_data = down_regulated[down_regulated[gene_col] == gene]
+    if condition_col and virus_col:
+        for condition in pd.Series(gene_data[condition_col].dropna().unique()):
+            for virus in pd.Series(gene_data[virus_col].dropna().unique()):
+                count = len(gene_data[(gene_data[condition_col] == condition) & (gene_data[virus_col] == virus)])
+                if count > 0:
+                    down_matrix.append({
+                        'mapped_genesymbol': gene,
+                        'Condition': condition,
+                        'Virus': virus,
+                        'DOWN_Count': count
+                    })
+
+df_down_matrix = pd.DataFrame(down_matrix)
+
+print(f"✓ Created UP matrix: {len(df_up_matrix)} entries")
+print(f"✓ Created DOWN matrix: {len(df_down_matrix)} entries")
+
+# -------------------------
+# Write results to Excel
+# -------------------------
+print(f"\n[6/6] Writing results to Excel...")
+print("="*80)
+
+try:
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        # Comprehensive statistics
+        if not df_comprehensive.empty:
+            df_comprehensive.to_excel(writer, sheet_name='Comprehensive_Ranking', index=False)
+            print("  ✓ Comprehensive_Ranking")
+        else:
+            # write empty DataFrame with columns for consistency
+            pd.DataFrame(columns=['mapped_genesymbol']).to_excel(writer, sheet_name='Comprehensive_Ranking', index=False)
+            print("  ✓ Comprehensive_Ranking (empty)")
+
+        # UP-regulated ranking
+        if not df_up_ranking.empty:
+            df_up_ranking.to_excel(writer, sheet_name='UP_Regulated_Ranking', index=False)
+        else:
+            pd.DataFrame(columns=['mapped_genesymbol']).to_excel(writer, sheet_name='UP_Regulated_Ranking', index=False)
+        print("  ✓ UP_Regulated_Ranking")
+
+        # DOWN-regulated ranking
+        if not df_down_ranking.empty:
+            df_down_ranking.to_excel(writer, sheet_name='DOWN_Regulated_Ranking', index=False)
+        else:
+            pd.DataFrame(columns=['mapped_genesymbol']).to_excel(writer, sheet_name='DOWN_Regulated_Ranking', index=False)
+        print("  ✓ DOWN_Regulated_Ranking")
+
+        # Both UP and DOWN
+        if not df_both.empty:
+            df_both.to_excel(writer, sheet_name='Both_UP_and_DOWN', index=False)
+            print("  ✓ Both_UP_and_DOWN")
+
+        # UP matrix
+        if not df_up_matrix.empty:
+            df_up_matrix.to_excel(writer, sheet_name='UP_Condition_Virus_Matrix', index=False)
+            print("  ✓ UP_Condition_Virus_Matrix")
+
+        # DOWN matrix
+        if not df_down_matrix.empty:
+            df_down_matrix.to_excel(writer, sheet_name='DOWN_Condition_Virus_Matrix', index=False)
+            print("  ✓ DOWN_Condition_Virus_Matrix")
+
+        # All UP data
+        if not up_regulated.empty:
+            up_regulated.to_excel(writer, sheet_name='All_UP_Data', index=False)
+            print("  ✓ All_UP_Data")
+        else:
+            pd.DataFrame(columns=df_clean.columns).to_excel(writer, sheet_name='All_UP_Data', index=False)
+            print("  ✓ All_UP_Data (empty)")
+
+        # All DOWN data
+        if not down_regulated.empty:
+            down_regulated.to_excel(writer, sheet_name='All_DOWN_Data', index=False)
+            print("  ✓ All_DOWN_Data")
+        else:
+            pd.DataFrame(columns=df_clean.columns).to_excel(writer, sheet_name='All_DOWN_Data', index=False)
+            print("  ✓ All_DOWN_Data (empty)")
+
+    print("\n" + "="*80)
+    print("✓ SUCCESS!")
+    print("="*80)
+    print(f"\nOutput saved to:\n{output_file}")
+
+except Exception as e:
+    print("✗ ERROR writing file:")
+    traceback.print_exc()
+    raise SystemExit(1)
+
+# -------------------------
+# Print summary
+# -------------------------
+print("\n" + "="*80)
+print("ANALYSIS SUMMARY")
+print("="*80)
+print(f"\nTotal entries analyzed: {len(df_clean)}")
+print(f"Total unique genes: {len(all_genes)}")
+print(f"Genes with UP-regulation: {len(df_up_ranking)}")
+print(f"Genes with DOWN-regulation: {len(df_down_ranking)}")
+print(f"Genes with BOTH: {len(both_genes)}")
+if condition_col:
+    print(f"Total unique conditions: {df_clean[condition_col].nunique()}")
+if virus_col:
+    print(f"Total unique viruses: {df_clean[virus_col].nunique()}")
+
+print("\n" + "="*80)
+print("TOP 20 CONSISTENTLY UP-REGULATED GENES")
+print("="*80)
+if not df_up_ranking.empty:
+    top_up = df_up_ranking.head(20)[['Rank', 'mapped_genesymbol', 'Num_Conditions', 'Num_Viruses', 'Consistency_Score', 'Total_UP_Count']]
+    print(top_up.to_string(index=False))
+else:
+    print("No UP-regulated genes found.")
+
+print("\n" + "="*80)
+print("TOP 20 CONSISTENTLY DOWN-REGULATED GENES")
+print("="*80)
+if not df_down_ranking.empty:
+    top_down = df_down_ranking.head(20)[['Rank', 'mapped_genesymbol', 'Num_Conditions', 'Num_Viruses', 'Consistency_Score', 'Total_DOWN_Count']]
+    print(top_down.to_string(index=False))
+else:
+    print("No DOWN-regulated genes found.")
+
+if not df_both.empty:
+    print("\n" + "="*80)
+    print("TOP 15 GENES WITH BOTH UP AND DOWN REGULATION")
+    print("="*80)
+    top_both = df_both.head(15)[['Rank', 'mapped_genesymbol', 'UP_Conditions', 'DOWN_Conditions', 'UP_Viruses', 'DOWN_Viruses', 'Overall_Diversity']]
+    print(top_both.to_string(index=False))
+
+print("\n" + "="*80)
+print("✓ Consistent regulation ranking completed successfully!")
+print(f"✓ Results saved to: {os.path.basename(output_file)}")
+print("="*80)
