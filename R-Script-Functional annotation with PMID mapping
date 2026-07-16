@@ -1,0 +1,251 @@
+#!/usr/bin/env Rscript
+# =============================================================================
+# fetch_go_annotations.R  (Automated Batch-Recursive Version for RStudio)
+# =============================================================================
+
+suppressWarnings(suppressMessages({
+  need <- c("jsonlite", "data.table", "stringr", "purrr")
+  missing <- need[!vapply(need, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing) > 0) install.packages(missing, repos = "https://cloud.r-project.org")
+  library(jsonlite)
+  library(data.table)
+  library(stringr)
+  library(purrr)
+}))
+
+# -----------------------------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------------------------
+DEFAULT_TAXON_ID              <- ""         
+DEFAULT_OUTPUT_NAME_WITH_REFS <- "Functional_Annotation_with_GO_References.csv"
+DEFAULT_OUTPUT_NAME_NO_REFS   <- "Functional_Annotation_with_GO_no_References.csv"
+
+QUICKGO_ANNOTATION_URL   <- "https://www.ebi.ac.uk/QuickGO/services/annotation/search"
+QUICKGO_PAGE_SIZE        <- 100        
+QUICKGO_ID_BATCH_SIZE    <- 40         
+REQUEST_DELAY_SEC        <- 0.34       
+MAX_RETRIES              <- 4
+HTTP_METHOD              <- "wininet"  
+AUTOMATED_EVIDENCE_CODES <- c("IEA")
+
+# -----------------------------------------------------------------------------
+# CORE LOGIC HELPERS
+# -----------------------------------------------------------------------------
+build_query_string <- function(query) {
+  query <- query[!vapply(query, is.null, logical(1))]
+  if (length(query) == 0) return("")
+  parts <- mapply(function(name, value) {
+    paste0(utils::URLencode(name, reserved = TRUE), "=",
+           utils::URLencode(as.character(value), reserved = TRUE))
+  }, names(query), query, SIMPLIFY = TRUE)
+  paste(parts, collapse = "&")
+}
+
+http_get_json <- function(url, query) {
+  qs <- build_query_string(query)
+  full_url <- if (nzchar(qs)) paste0(url, "?", qs) else url
+  
+  for (attempt in seq_len(MAX_RETRIES)) {
+    tmp <- tempfile(fileext = ".json")
+    ok <- tryCatch({
+      suppressWarnings(
+        utils::download.file(
+          full_url,
+          destfile = tmp,
+          method   = HTTP_METHOD,
+          quiet    = TRUE,
+          headers  = c(Accept = "application/json")
+        )
+      )
+      TRUE
+    }, error = function(e) FALSE)
+    
+    if (isTRUE(ok) && file.exists(tmp) && file.size(tmp) > 0) {
+      js <- tryCatch(jsonlite::fromJSON(tmp, flatten = TRUE), error = function(e) NULL)
+      unlink(tmp)
+      if (!is.null(js)) return(js)
+    } else {
+      unlink(tmp)
+    }
+    Sys.sleep(1 * attempt)
+  }
+  return(NULL)
+}
+
+classify_reference <- function(ref) {
+  if (length(ref) == 0 || is.na(ref) || ref == "") return(c(type = NA_character_, id = NA_character_))
+  if (str_detect(ref, "(?i)^pmid:"))   return(c(type = "PMID",   id = str_remove(ref, "(?i)^pmid:")))
+  if (str_detect(ref, "(?i)^doi:"))    return(c(type = "DOI",    id = str_remove(ref, "(?i)^doi:")))
+  if (str_detect(ref, "(?i)^go_ref:")) return(c(type = "GO_REF", id = str_remove(ref, "(?i)^go_ref:")))
+  c(type = "OTHER", id = ref)
+}
+
+fetch_batch <- function(ids_chunk, taxon_id) {
+  gp_ids <- paste0("UniProtKB:", ids_chunk, collapse = ",")
+  page <- 1
+  out <- list()
+  repeat {
+    q <- list(geneProductId = gp_ids, limit = QUICKGO_PAGE_SIZE, page = page)
+    if (nzchar(taxon_id)) q$taxonId <- taxon_id
+    js <- http_get_json(QUICKGO_ANNOTATION_URL, q)
+    Sys.sleep(REQUEST_DELAY_SEC)
+    if (is.null(js) || is.null(js$results) || length(js$results) == 0) break
+    
+    res <- as.data.table(js$results)
+    keep_cols <- intersect(c("geneProductId", "symbol", "qualifier", "goId", "goName",
+                             "goAspect", "goEvidence", "evidenceCode", "reference",
+                             "withFrom", "assignedBy", "taxonId", "date"), names(res))
+    out[[length(out) + 1]] <- res[, ..keep_cols]
+    
+    total_pages <- tryCatch({
+      tp <- js$pageInfo$total
+      if (is.null(tp) || length(tp) == 0) NA_integer_ else as.integer(tp)
+    }, error = function(e) NA_integer_)
+    
+    if (is.na(total_pages) || page >= total_pages) break
+    page <- page + 1
+  }
+  if (length(out) == 0) return(NULL)
+  rbindlist(out, use.names = TRUE, fill = TRUE)
+}
+
+fetch_go_annotations_for_uniprot <- function(uniprot_ids, taxon_id = DEFAULT_TAXON_ID) {
+  uniprot_ids <- unique(na.omit(uniprot_ids[uniprot_ids != ""]))
+  if (length(uniprot_ids) == 0) return(NULL)
+  chunks <- split(uniprot_ids, ceiling(seq_along(uniprot_ids) / QUICKGO_ID_BATCH_SIZE))
+  
+  results <- imap(chunks, function(chunk, i) {
+    fetch_batch(chunk, taxon_id)
+  })
+  results <- compact(results)
+  if (length(results) == 0) return(NULL)
+  rbindlist(results, use.names = TRUE, fill = TRUE)
+}
+
+write_outputs <- function(result, query_file) {
+  out_dir <- dirname(query_file)
+  
+  # Structural Fix: Checked across text contents instead of numeric dimensions
+  has_real_ref <- (!is.na(result$Reference_PMIDs) & result$Reference_PMIDs != "") | 
+    (!is.na(result$Reference_DOIs) & result$Reference_DOIs != "")
+  
+  result_with_refs <- result[has_real_ref]
+  result_no_refs    <- result[!has_real_ref]
+  
+  out_path_with_refs <- file.path(out_dir, DEFAULT_OUTPUT_NAME_WITH_REFS)
+  fwrite(result_with_refs, out_path_with_refs)
+  
+  out_path_no_refs <- file.path(out_dir, DEFAULT_OUTPUT_NAME_NO_REFS)
+  fwrite(result_no_refs, out_path_no_refs)
+  
+  message("    -> Saved: ", out_path_with_refs)
+  message("    -> Saved: ", out_path_no_refs)
+}
+
+# -----------------------------------------------------------------------------
+# MAIN PROCESSOR FOR A SINGLE FILE
+# -----------------------------------------------------------------------------
+main <- function(query_file, taxon_id = DEFAULT_TAXON_ID) {
+  if (!file.exists(query_file)) return(FALSE)
+  
+  query <- tryCatch(fread(query_file, colClasses = "character", encoding = "UTF-8"), error = function(e) NULL)
+  if (is.null(query) || nrow(query) == 0) return(FALSE)
+  
+  find_col <- function(candidates) {
+    hit <- names(query)[toupper(names(query)) %in% toupper(candidates)]
+    if (length(hit) > 0) return(hit[1])
+    NA_character_
+  }
+  
+  col_uniprot <- find_col(c("UNIPROT", "UNIPROTKB", "UNIPROT_ID"))
+  col_go      <- find_col(c("GO", "GO_ID", "GOID"))
+  
+  if (is.na(col_go) || is.na(col_uniprot)) {
+    warning("Skipping file (Missing UNIPROT or GO column): ", query_file)
+    return(FALSE)
+  }
+  
+  query[, .uniprot := toupper(trimws(get(col_uniprot)))]
+  
+  ann <- fetch_go_annotations_for_uniprot(query$.uniprot, taxon_id = taxon_id)
+  if (is.null(ann) || nrow(ann) == 0) return(FALSE)
+  
+  ref_class <- t(vapply(ann$reference, classify_reference, character(2)))
+  ann[, `:=`(ref_type = ref_class[, "type"], ref_id = ref_class[, "id"])]
+  ann[, is_automated := goEvidence %chin% AUTOMATED_EVIDENCE_CODES]
+  
+  ann[, .join_uniprot := toupper(trimws(str_remove(geneProductId, "(?i)^uniprotkb:")))]
+  ann[, .join_go := toupper(trimws(goId))]
+  
+  agg <- ann[, {
+    pmids   <- sort(unique(ref_id[ref_type == "PMID"]))
+    dois    <- sort(unique(ref_id[ref_type == "DOI"]))
+    gorefs  <- sort(unique(ref_id[ref_type == "GO_REF"]))
+    .(
+      GO_Term_Name         = paste(sort(unique(na.omit(goName))), collapse = ";"),
+      GO_Aspect            = paste(sort(unique(na.omit(goAspect))), collapse = ";"),
+      GO_Evidence_Codes    = paste(sort(unique(na.omit(goEvidence))), collapse = ";"),
+      Manually_Reviewed    = any(!is_automated),
+      Reference_PMIDs      = paste(pmids, collapse = ";"),
+      Reference_DOIs       = paste(dois, collapse = ";"),
+      Reference_GO_REFs    = paste(gorefs, collapse = ";"),
+      Preferred_Reference  = if (length(pmids) > 0) paste0("PMID:", pmids[1])
+      else if (length(dois) > 0) paste0("DOI:", dois[1])
+      else if (length(gorefs) > 0) paste0("GO_REF:", gorefs[1])
+      else NA_character_,
+      N_References          = length(unique(na.omit(ref_id))),
+      Assigned_By          = paste(sort(unique(na.omit(assignedBy))), collapse = ";")
+    )
+  }, by = .(.join_uniprot, .join_go)]
+  
+  query[, .join_uniprot := .uniprot]
+  query[, .join_go := toupper(trimws(get(col_go)))]
+  
+  # FIXED: Merge using an explicit left-join allowing duplicates safely
+  result <- merge(query, agg, by = c(".join_uniprot", ".join_go"), all.x = TRUE, sort = FALSE)
+  
+  fill_cols <- c("GO_Term_Name", "GO_Aspect", "GO_Evidence_Codes", "Reference_PMIDs",
+                 "Reference_DOIs", "Reference_GO_REFs", "Preferred_Reference", "Assigned_By")
+  for (col in fill_cols) result[is.na(get(col)), (col) := ""]
+  result[is.na(Manually_Reviewed), Manually_Reviewed := FALSE]
+  result[is.na(N_References), N_References := 0L]
+  result[, c(".join_uniprot", ".join_go", ".uniprot") := NULL]
+  
+  write_outputs(result, query_file)
+  return(TRUE)
+}
+
+# -----------------------------------------------------------------------------
+# RECURSIVE BATCH SCANNER
+# -----------------------------------------------------------------------------
+batch_process_all <- function(root_folder, taxon_id = DEFAULT_TAXON_ID) {
+  if (!dir.exists(root_folder)) stop("Root directory does not exist: ", root_folder)
+  
+  message("Scanning for target files inside: ", root_folder)
+  all_files <- list.files(path = root_folder, pattern = "^Functional_Annotation\\.csv$", 
+                          full.names = TRUE, recursive = TRUE, ignore.case = TRUE)
+  
+  if (length(all_files) == 0) {
+    message("No 'Functional_Annotation.csv' files found in any subfolders.")
+    return(invisible(NULL))
+  }
+  
+  message("Found ", length(all_files), " target files to process.\n")
+  
+  for (i in seq_along(all_files)) {
+    current_file <- all_files[i]
+    message("[", i, "/", length(all_files), "] Processing: ", current_file)
+    success <- main(current_file, taxon_id = taxon_id)
+    if (success) {
+      message("--- Done with item ", i, " ---\n")
+    } else {
+      message("--- Failed or skipped item ", i, " ---\n")
+    }
+  }
+  message("ALL BATCH TASKS COMPLETED SUCCESSFULLY!")
+}
+
+# =============================================================================
+# RUN AUTOMATION TRIGGER
+# =============================================================================
+batch_process_all("C:/Vineetha")
