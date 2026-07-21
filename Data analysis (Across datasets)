@@ -1,0 +1,257 @@
+r"""Find common and virus-unique annotated symbols across functional-annotation CSV files.
+
+The script recursively reads every file named ``Annotated_Dataset.csv`` under
+the configured root. It expects paths structured like::
+
+    <root>\BKV\Downregulated\Annotated_Dataset.csv
+    <root>\HIV\Upregulated\Annotated_Dataset.csv
+
+Thus, the parent folder before Upregulated/Downregulated is the virus and the
+regulation-folder name supplies UP/DOWN. Every result is separated by ontology
+(MF, CC, BP, or Pathway). A symbol is common when it occurs in more than one
+virus for the same direction and ontology; it is unique when it occurs in only
+one virus for that direction and ontology.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+from pathlib import Path
+
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+
+ROOT_FOLDER = Path(
+    r"D:\Ph.D\First_Objective\Devika_Reanalysis\Functional_Annotation\Virus_Functional_Annotation_Plasma"
+)
+OUTPUT_PATH = ROOT_FOLDER / "Virus_Functional_Annotation_Common_Symbols.xlsx"
+TARGET_FILENAME = "annotated_dataset.csv"
+
+FONT_NAME = "Arial"
+TITLE_FONT = Font(name=FONT_NAME, bold=True, size=14, color="1F4E78")
+HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
+HEADER_FONT = Font(name=FONT_NAME, bold=True, size=10, color="FFFFFF")
+NORMAL_FONT = Font(name=FONT_NAME, size=10)
+THIN = Side(style="thin", color="B7B7B7")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+
+def text_column_name(columns: pd.Index, required: str) -> str:
+    """Find a CSV header ignoring case, spaces, underscores, and hyphens."""
+    canonical = lambda value: re.sub(r"[\s_-]+", "", str(value)).upper()
+    matches = [column for column in columns if canonical(column) == canonical(required)]
+    if not matches:
+        raise ValueError(f"Required column {required!r} is absent. Found: {list(columns)}")
+    return matches[0]
+
+
+def direction_and_virus(csv_path: Path, root: Path) -> tuple[str, str]:
+    """Derive direction and virus from the directory components below root."""
+    parts = csv_path.relative_to(root).parts[:-1]
+    direction_patterns = {
+        "UP": re.compile(r"^up(?:regulated)?$", re.IGNORECASE),
+        "DOWN": re.compile(r"^down(?:regulated)?$", re.IGNORECASE),
+    }
+    for index, part in enumerate(parts):
+        for direction, pattern in direction_patterns.items():
+            if pattern.fullmatch(part):
+                if index == 0:
+                    raise ValueError("The regulation folder has no preceding virus folder.")
+                return direction, parts[index - 1]
+    raise ValueError(
+        "Could not find an Upregulated/Downregulated folder in the path: "
+        f"{csv_path}"
+    )
+
+
+def normalise_ontology(value: object) -> str | None:
+    """Map common ontology labels to the four requested output categories."""
+    if pd.isna(value) or not str(value).strip():
+        return None
+    compact = re.sub(r"[\s_-]+", "", str(value)).upper()
+    if compact in {"MF", "MOLECULARFUNCTION", "GOMOLECULARFUNCTION"}:
+        return "MF"
+    if compact in {"CC", "CELLULARCOMPONENT", "GOCELLULARCOMPONENT"}:
+        return "CC"
+    # The supplied dataset uses BP for Biological Process.
+    if compact in {"BF", "BP", "BIOLOGICALFUNCTION", "BIOLOGICALPROCESS", "GOBIOLOGICALPROCESS"}:
+        return "BP"
+    if compact in {"PATHWAY", "PATHWAYS", "KEGG", "REACTOME", "WIKIPATHWAYS"}:
+        return "Pathway"
+    return None
+
+
+def read_annotation_file(csv_path: Path, root: Path) -> pd.DataFrame:
+    """Load one file, retaining only usable SYMBOL and requested ONTOLOGY values."""
+    try:
+        # The source exports are comma-delimited and contain a quoted, multi-line
+        # header value (p-value). The C parser handles this correctly; Python's
+        # automatic delimiter detector does not.
+        raw = pd.read_csv(csv_path, dtype="string", low_memory=False)
+    except UnicodeDecodeError:
+        raw = pd.read_csv(csv_path, dtype="string", encoding="latin-1", low_memory=False)
+
+    symbol_column = text_column_name(raw.columns, "SYMBOL")
+    ontology_column = text_column_name(raw.columns, "ONTOLOGY")
+    direction, virus = direction_and_virus(csv_path, root)
+
+    output = pd.DataFrame(
+        {
+            "Direction": direction,
+            "Virus": str(virus).strip(),
+            "Ontology": raw[ontology_column].map(normalise_ontology),
+            "SYMBOL": raw[symbol_column].astype("string").str.strip(),
+            "Source file": str(csv_path.relative_to(root)),
+        }
+    )
+    output = output.dropna(subset=["Ontology", "SYMBOL"])
+    output = output[output["SYMBOL"] != ""].copy()
+    output["SYMBOL"] = output["SYMBOL"].str.upper()
+    return output
+
+
+def load_all_annotations(root: Path) -> tuple[pd.DataFrame, list[str], int]:
+    """Read all matching files and report files that could not be used."""
+    direction_folder = re.compile(r"^(?:up|upregulated|down|downregulated)$", re.IGNORECASE)
+    files = sorted(
+        path for path in root.rglob("*.csv")
+        if path.name.casefold() == TARGET_FILENAME and direction_folder.fullmatch(path.parent.name)
+    )
+    if not files:
+        raise ValueError(f"No {TARGET_FILENAME} files were found below: {root}")
+
+    frames: list[pd.DataFrame] = []
+    skipped: list[str] = []
+    for file in files:
+        try:
+            frames.append(read_annotation_file(file, root))
+        except (OSError, UnicodeDecodeError, ValueError, pd.errors.ParserError) as error:
+            skipped.append(f"{file.relative_to(root)} — {error}")
+    if not frames:
+        raise ValueError("No usable annotation files were found. " + " | ".join(skipped))
+
+    combined = pd.concat(frames, ignore_index=True)
+    # One gene can occur multiple times in a source file because of multiple terms.
+    # For common/unique symbols, count it once per Virus + Direction + Ontology.
+    combined = combined.drop_duplicates(subset=["Direction", "Virus", "Ontology", "SYMBOL"])
+    return combined, skipped, len(files)
+
+
+def build_summary(df: pd.DataFrame) -> pd.DataFrame:
+    return (
+        df.groupby(["Direction", "Ontology", "Virus"], sort=True)["SYMBOL"]
+        .nunique()
+        .reset_index(name="Unique SYMBOL Count")
+        .sort_values(["Direction", "Ontology", "Virus"])
+        .reset_index(drop=True)
+    )
+
+
+def build_common_and_unique(df: pd.DataFrame, direction: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    subset = df.loc[df["Direction"] == direction]
+    rows_common, rows_unique = [], []
+    for (ontology, symbol), group in subset.groupby(["Ontology", "SYMBOL"], sort=True):
+        viruses = sorted(group["Virus"].unique(), key=str.casefold)
+        record = {
+            "Ontology": ontology,
+            "SYMBOL": symbol,
+            "Virus Count": len(viruses),
+            "Viruses": ", ".join(viruses),
+        }
+        if len(viruses) > 1:
+            rows_common.append(record)
+        else:
+            rows_unique.append(
+                {
+                    "Ontology": ontology,
+                    "SYMBOL": symbol,
+                    "Virus": viruses[0],
+                }
+            )
+
+    common = pd.DataFrame(rows_common, columns=["Ontology", "SYMBOL", "Virus Count", "Viruses"])
+    unique = pd.DataFrame(rows_unique, columns=["Ontology", "SYMBOL", "Virus"])
+    if not common.empty:
+        common = common.sort_values(["Ontology", "Virus Count", "SYMBOL"], ascending=[True, False, True])
+    if not unique.empty:
+        unique = unique.sort_values(["Ontology", "Virus", "SYMBOL"])
+    return common.reset_index(drop=True), unique.reset_index(drop=True)
+
+
+def write_table(wb: Workbook, name: str, data: pd.DataFrame, title: str, widths: list[int]) -> None:
+    ws = wb.create_sheet(name)
+    ws["A1"] = title
+    ws["A1"].font = TITLE_FONT
+    for column_index, heading in enumerate(data.columns, start=1):
+        cell = ws.cell(3, column_index, heading)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.border = BORDER
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for row_index, row in enumerate(data.itertuples(index=False, name=None), start=4):
+        for column_index, value in enumerate(row, start=1):
+            cell = ws.cell(row_index, column_index, value)
+            cell.font = NORMAL_FONT
+            cell.border = BORDER
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    ws.freeze_panes = "A4"
+    ws.auto_filter.ref = f"A3:{get_column_letter(max(1, len(data.columns)))}{max(3, ws.max_row)}"
+    for index, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(index)].width = width
+
+
+def write_read_me(wb: Workbook, root: Path, files_found: int, rows: int, skipped: list[str]) -> None:
+    ws = wb.create_sheet("Read_Me")
+    ws["A1"] = "Virus Functional Annotation – Common and Unique SYMBOLs"
+    ws["A1"].font = TITLE_FONT
+    notes = [
+        ("Input", f"Scanned {files_found} file(s) named Annotated_Dataset.csv below: {root}"),
+        ("Path rules", "Virus is the folder immediately before Upregulated or Downregulated. The regulation folder determines UP or DOWN."),
+        ("Ontology", "MF = Molecular Function; CC = Cellular Component; BP = Biological Process. Pathway includes Pathway, KEGG, Reactome, and WikiPathways."),
+        ("Common", "A SYMBOL is common when it occurs in more than one virus, within the same Direction and Ontology."),
+        ("Unique", "A SYMBOL is unique when it occurs in exactly one virus, within the same Direction and Ontology."),
+        ("Duplicate handling", "Repeated SYMBOL rows, including rows annotated to multiple terms, are counted once per Direction + Virus + Ontology + SYMBOL."),
+        ("Analyzed records", f"{rows:,} distinct Direction + Virus + Ontology + SYMBOL records were analyzed."),
+        ("Skipped files", "None" if not skipped else "\n".join(skipped)),
+    ]
+    for row_index, (topic, text) in enumerate(notes, start=3):
+        ws.cell(row_index, 1, topic).font = Font(name=FONT_NAME, bold=True, color="1F4E78")
+        ws.cell(row_index, 2, text).font = NORMAL_FONT
+        ws.cell(row_index, 1).alignment = ws.cell(row_index, 2).alignment = Alignment(vertical="top", wrap_text=True)
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 120
+
+
+def main(root: Path, output: Path) -> None:
+    if not root.is_dir():
+        raise ValueError(f"Input folder does not exist: {root}")
+    data, skipped, files_found = load_all_annotations(root)
+    common_up, unique_up = build_common_and_unique(data, "UP")
+    common_down, unique_down = build_common_and_unique(data, "DOWN")
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    write_read_me(wb, root, files_found, len(data), skipped)
+    write_table(wb, "Summary", build_summary(data), "Unique SYMBOL Counts by Virus, Direction, and Ontology", [16, 16, 30, 22])
+    write_table(wb, "Common_UP", common_up, "Common UP SYMBOLs Across Viruses", [16, 22, 14, 60])
+    write_table(wb, "Common_DOWN", common_down, "Common DOWN SYMBOLs Across Viruses", [16, 22, 14, 60])
+    write_table(wb, "Unique_UP", unique_up, "Unique UP SYMBOLs by Virus", [16, 22, 30])
+    write_table(wb, "Unique_DOWN", unique_down, "Unique DOWN SYMBOLs by Virus", [16, 22, 30])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(output)
+    print(f"Saved functional-annotation workbook: {output}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("root", nargs="?", type=Path, default=ROOT_FOLDER, help="Root annotation folder")
+    parser.add_argument("output", nargs="?", type=Path, default=OUTPUT_PATH, help="Output .xlsx path")
+    args = parser.parse_args()
+    try:
+        main(args.root, args.output)
+    except (OSError, ValueError, KeyError) as error:
+        raise SystemExit(f"ERROR: {error}") from error
